@@ -1,0 +1,544 @@
+{\rtf1\ansi\deff0\nouicompat{\fonttbl{\f0\fnil\fcharset0 Calibri;}}
+{\colortbl ;\red0\green0\blue255;}
+{\*\generator Riched20 10.0.19041}\viewkind4\uc1 
+\pard\sa200\sl276\slmult1\f0\fs22\lang10 // Sidecar local que abre la conexion WSS real hacia el servidor de Galaxy\par
+// usando un ClientHello TLS clonado de Chrome (via uTLS), para que el\par
+// fingerprint JA3/JA4 de la capa TLS coincida con el de un navegador real.\par
+// El cliente Electron/Node habla WS plano contra este proceso en\par
+// 127.0.0.1 y no necesita saber nada de uTLS: la relacion de mensajes es\par
+// 1:1, este proceso solo hace de puente (bridge) frame por frame.\par
+package main\par
+\par
+import (\par
+\tab "bufio"\par
+\tab "bytes"\par
+\tab "context"\par
+\tab "encoding/base64"\par
+\tab "encoding/json"\par
+\tab "flag"\par
+\tab "fmt"\par
+\tab "io"\par
+\tab "log"\par
+\tab "net"\par
+\tab "net/http"\par
+\tab "net/url"\par
+\tab "os"\par
+\tab "os/signal"\par
+\tab "strings"\par
+\tab "syscall"\par
+\tab "time"\par
+\par
+\tab "github.com/gorilla/websocket"\par
+\tab utls "github.com/refraction-networking/utls"\par
+)\par
+\par
+// Headers de aplicacion que manda el cliente web real (galaxy.mobstudio.ru).\par
+// Deben coincidir con WS_HANDSHAKE_HEADERS en src/galaxy-client.js; si ese\par
+// archivo cambia, hay que actualizar esto a mano tambien (no hay una unica\par
+// fuente de verdad compartida entre Node y Go).\par
+var defaultHeaders = map[string]string\{\par
+\tab "Origin":          "{{\field{\*\fldinst{HYPERLINK https://galaxy.mobstudio.ru }}{\fldrslt{https://galaxy.mobstudio.ru\ul0\cf0}}}}\f0\fs22 ",\par
+\tab "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",\par
+\tab "Accept-Encoding": "gzip, deflate, br, zstd",\par
+\tab "Accept-Language": "es-ES,es;q=0.9",\par
+\tab "Cache-Control":   "no-cache",\par
+\tab "Pragma":          "no-cache",\par
+\tab "Sec-GPC":         "1",\par
+\}\par
+\par
+// Debe coincidir con WS_URL en src/galaxy-client.js.\par
+const defaultTargetURL = "wss://cs.mobstudio.ru:6672/"\par
+\par
+var upgrader = websocket.Upgrader\{\par
+\tab ReadBufferSize:  4096,\par
+\tab WriteBufferSize: 4096,\par
+\tab // Solo escuchamos en 127.0.0.1; el unico cliente posible es nuestra\par
+\tab // propia app Electron, no hace falta validar Origin.\par
+\tab CheckOrigin: func(r *http.Request) bool \{ return true \},\par
+\}\par
+\par
+type proxyConfig struct \{\par
+\tab host string\par
+\tab port string\par
+\tab user string\par
+\tab pass string\par
+\}\par
+\par
+func parseProxyFromQuery(q url.Values) *proxyConfig \{\par
+\tab host := strings.TrimSpace(q.Get("proxyHost"))\par
+\tab port := strings.TrimSpace(q.Get("proxyPort"))\par
+\tab if host == "" || port == "" \{\par
+\tab\tab return nil\par
+\tab\}\par
+\tab return &proxyConfig\{\par
+\tab\tab host: host,\par
+\tab\tab port: port,\par
+\tab\tab user: q.Get("proxyUser"),\par
+\tab\tab pass: q.Get("proxyPass"),\par
+\tab\}\par
+\}\par
+\par
+func parseHeadersFromQuery(q url.Values) map[string]string \{\par
+\tab raw := strings.TrimSpace(q.Get("headers"))\par
+\tab if raw == "" \{\par
+\tab\tab return nil\par
+\tab\}\par
+\tab var headers map[string]string\par
+\tab if err := json.Unmarshal([]byte(raw), &headers); err != nil \{\par
+\tab\tab log.Printf("[local] headers JSON invalido, usando defaults: %v", err)\par
+\tab\tab return nil\par
+\tab\}\par
+\tab return headers\par
+\}\par
+\par
+// prefixedConn antepone bytes ya leidos (y no consumidos) del handshake del\par
+// proxy a las lecturas subsiguientes. Equivalente a socket.unshift() en\par
+// Node (ver connectHttpProxyTunnel en proxy.js): el proxy puede mandar el\par
+// 200 de la respuesta CONNECT pegado con el primer byte del handshake TLS\par
+// en el mismo paquete TCP, y esos bytes extra no se pueden perder.\par
+type prefixedConn struct \{\par
+\tab net.Conn\par
+\tab leftover []byte\par
+\}\par
+\par
+func (c *prefixedConn) Read(p []byte) (int, error) \{\par
+\tab if len(c.leftover) > 0 \{\par
+\tab\tab n := copy(p, c.leftover)\par
+\tab\tab c.leftover = c.leftover[n:]\par
+\tab\tab return n, nil\par
+\tab\}\par
+\tab return c.Conn.Read(p)\par
+\}\par
+\par
+// connectThroughProxy replica connectHttpProxyTunnel de proxy.js: abre TCP\par
+// contra el proxy, manda CONNECT, y devuelve el socket crudo tunelizado\par
+// hacia targetAddr una vez que el proxy respondio 200.\par
+func connectThroughProxy(ctx context.Context, proxy *proxyConfig, targetAddr string) (net.Conn, error) \{\par
+\tab d := net.Dialer\{Timeout: 15 * time.Second\}\par
+\tab proxyAddr := net.JoinHostPort(proxy.host, proxy.port)\par
+\tab conn, err := d.DialContext(ctx, "tcp", proxyAddr)\par
+\tab if err != nil \{\par
+\tab\tab return nil, fmt.Errorf("no se pudo conectar al proxy %s: %w", proxyAddr, err)\par
+\tab\}\par
+\par
+\tab reqLines := []string\{\par
+\tab\tab fmt.Sprintf("CONNECT %s HTTP/1.1", targetAddr),\par
+\tab\tab fmt.Sprintf("Host: %s", targetAddr),\par
+\tab\tab "Connection: Keep-Alive",\par
+\tab\tab "Proxy-Connection: Keep-Alive",\par
+\tab\}\par
+\tab if proxy.user != "" || proxy.pass != "" \{\par
+\tab\tab auth := base64.StdEncoding.EncodeToString([]byte(proxy.user + ":" + proxy.pass))\par
+\tab\tab reqLines = append(reqLines, "Proxy-Authorization: Basic "+auth)\par
+\tab\}\par
+\par
+\tab if _, err := conn.Write([]byte(strings.Join(reqLines, "\\r\\n") + "\\r\\n\\r\\n")); err != nil \{\par
+\tab\tab conn.Close()\par
+\tab\tab return nil, fmt.Errorf("error escribiendo CONNECT: %w", err)\par
+\tab\}\par
+\par
+\tab conn.SetReadDeadline(time.Now().Add(15 * time.Second))\par
+\tab var buf []byte\par
+\tab tmp := make([]byte, 4096)\par
+\tab headerEnd := -1\par
+\tab for headerEnd == -1 \{\par
+\tab\tab n, err := conn.Read(tmp)\par
+\tab\tab if n > 0 \{\par
+\tab\tab\tab buf = append(buf, tmp[:n]...)\par
+\tab\tab\tab headerEnd = bytes.Index(buf, []byte("\\r\\n\\r\\n"))\par
+\tab\tab\}\par
+\tab\tab if err != nil \{\par
+\tab\tab\tab conn.Close()\par
+\tab\tab\tab return nil, fmt.Errorf("error leyendo respuesta del proxy: %w", err)\par
+\tab\tab\}\par
+\tab\}\par
+\tab conn.SetReadDeadline(time.Time\{\})\par
+\par
+\tab header := string(buf[:headerEnd])\par
+\tab leftover := buf[headerEnd+4:]\par
+\tab firstLine := strings.SplitN(header, "\\r\\n", 2)[0]\par
+\tab if !strings.Contains(firstLine, " 200 ") \{\par
+\tab\tab conn.Close()\par
+\tab\tab return nil, fmt.Errorf("proxy rechazo CONNECT %s (%s)", targetAddr, strings.TrimSpace(firstLine))\par
+\tab\}\par
+\par
+\tab return &prefixedConn\{Conn: conn, leftover: leftover\}, nil\par
+\}\par
+\par
+// dialUTLS abre la conexion (directa o via proxy) y hace el handshake TLS\par
+// con un ClientHello clonado de Chrome (uTLS) en vez del ClientHello nativo\par
+// de Go, que de otra forma delataria el binario como trafico no-navegador.\par
+//\par
+// Se conecta como NetDialTLSContext del Dialer de gorilla/websocket en vez\par
+// de usar el campo Proxy nativo de gorilla a proposito: gorilla tiene un\par
+// bug conocido (issue #779) cuando se combinan Proxy + NetDialTLSContext,\par
+// asi que el tunel CONNECT se maneja entero aca adentro.\par
+func dialUTLS(ctx context.Context, network, addr string, proxy *proxyConfig) (net.Conn, error) \{\par
+\tab host, _, err := net.SplitHostPort(addr)\par
+\tab if err != nil \{\par
+\tab\tab return nil, fmt.Errorf("direccion invalida %q: %w", addr, err)\par
+\tab\}\par
+\par
+\tab var rawConn net.Conn\par
+\tab if proxy != nil \{\par
+\tab\tab rawConn, err = connectThroughProxy(ctx, proxy, addr)\par
+\tab\} else \{\par
+\tab\tab d := net.Dialer\{Timeout: 15 * time.Second\}\par
+\tab\tab rawConn, err = d.DialContext(ctx, network, addr)\par
+\tab\}\par
+\tab if err != nil \{\par
+\tab\tab return nil, err\par
+\tab\}\par
+\par
+\tab uConn := utls.UClient(rawConn, &utls.Config\{ServerName: host\}, utls.HelloChrome_Auto)\par
+\tab rawConn.SetDeadline(time.Now().Add(15 * time.Second))\par
+\tab if err := uConn.Handshake(); err != nil \{\par
+\tab\tab rawConn.Close()\par
+\tab\tab return nil, fmt.Errorf("handshake TLS (uTLS) fallo: %w", err)\par
+\tab\}\par
+\tab rawConn.SetDeadline(time.Time\{\})\par
+\tab return uConn, nil\par
+\}\par
+\par
+// pipe relee mensajes de src y los reescribe en dst preservando el tipo de\par
+// frame (texto/binario) tal cual, sin reinterpretar el contenido.\par
+func pipe(src, dst *websocket.Conn, done chan<- error) \{\par
+\tab for \{\par
+\tab\tab mt, data, err := src.ReadMessage()\par
+\tab\tab if err != nil \{\par
+\tab\tab\tab done <- err\par
+\tab\tab\tab return\par
+\tab\tab\}\par
+\tab\tab if err := dst.WriteMessage(mt, data); err != nil \{\par
+\tab\tab\tab done <- err\par
+\tab\tab\tab return\par
+\tab\tab\}\par
+\tab\}\par
+\}\par
+\par
+func bridgeHandler(w http.ResponseWriter, r *http.Request) \{\par
+\tab q := r.URL.Query()\par
+\par
+\tab targetURL := strings.TrimSpace(q.Get("target"))\par
+\tab if targetURL == "" \{\par
+\tab\tab targetURL = defaultTargetURL\par
+\tab\}\par
+\tab proxy := parseProxyFromQuery(q)\par
+\tab headerOverrides := parseHeadersFromQuery(q)\par
+\par
+\tab localConn, err := upgrader.Upgrade(w, r, nil)\par
+\tab if err != nil \{\par
+\tab\tab log.Printf("[local] error en upgrade: %v", err)\par
+\tab\tab return\par
+\tab\}\par
+\tab defer localConn.Close()\par
+\par
+\tab headers := http.Header\{\}\par
+\tab for k, v := range defaultHeaders \{\par
+\tab\tab headers.Set(k, v)\par
+\tab\}\par
+\tab for k, v := range headerOverrides \{\par
+\tab\tab headers.Set(k, v)\par
+\tab\}\par
+\par
+\tab dialer := &websocket.Dialer\{\par
+\tab\tab NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) \{\par
+\tab\tab\tab return dialUTLS(ctx, network, addr, proxy)\par
+\tab\tab\},\par
+\tab\tab HandshakeTimeout:  15 * time.Second,\par
+\tab\tab EnableCompression: true,\par
+\tab\}\par
+\par
+\tab remoteConn, resp, err := dialer.Dial(targetURL, headers)\par
+\tab if err != nil \{\par
+\tab\tab status := ""\par
+\tab\tab if resp != nil \{\par
+\tab\tab\tab status = resp.Status\par
+\tab\tab\}\par
+\tab\tab log.Printf("[remote] error conectando a %s: %v %s", targetURL, err, status)\par
+\tab\tab localConn.WriteMessage(\par
+\tab\tab\tab websocket.CloseMessage,\par
+\tab\tab\tab websocket.FormatCloseMessage(1011, fmt.Sprintf("upstream dial failed: %v", err)),\par
+\tab\tab )\par
+\tab\tab return\par
+\tab\}\par
+\tab defer remoteConn.Close()\par
+\par
+\tab log.Printf("[bridge] conectado -> %s (proxy=%v)", targetURL, proxy != nil)\par
+\par
+\tab done := make(chan error, 2)\par
+\tab go pipe(localConn, remoteConn, done)\par
+\tab go pipe(remoteConn, localConn, done)\par
+\tab <-done\par
+\tab log.Printf("[bridge] sesion cerrada -> %s", targetURL)\par
+\}\par
+\par
+// dialUTLSForHTTP abre una conexion TCP+uTLS hacia host:port (optionalmente via\par
+// proxy HTTP CONNECT) lista para ser usada como transporte de peticiones HTTP/1.1.\par
+func dialUTLSForHTTP(ctx context.Context, host, port string, proxy *proxyConfig) (net.Conn, error) \{\par
+\tab addr := net.JoinHostPort(host, port)\par
+\tab var rawConn net.Conn\par
+\tab var err error\par
+\tab if proxy != nil \{\par
+\tab\tab rawConn, err = connectThroughProxy(ctx, proxy, addr)\par
+\tab\} else \{\par
+\tab\tab d := net.Dialer\{Timeout: 15 * time.Second\}\par
+\tab\tab rawConn, err = d.DialContext(ctx, "tcp", addr)\par
+\tab\}\par
+\tab if err != nil \{\par
+\tab\tab return nil, err\par
+\tab\}\par
+\tab spec, err := chromeHTTP11Spec()\par
+\tab if err != nil \{\par
+\tab\tab rawConn.Close()\par
+\tab\tab return nil, err\par
+\tab\}\par
+\par
+\tab uConn := utls.UClient(rawConn, &utls.Config\{ServerName: host\}, utls.HelloCustom)\par
+\tab if err := uConn.ApplyPreset(spec); err != nil \{\par
+\tab\tab rawConn.Close()\par
+\tab\tab return nil, fmt.Errorf("preset TLS HTTP/1.1 fallo: %w", err)\par
+\tab\}\par
+\tab rawConn.SetDeadline(time.Now().Add(15 * time.Second))\par
+\tab if err := uConn.Handshake(); err != nil \{\par
+\tab\tab rawConn.Close()\par
+\tab\tab return nil, fmt.Errorf("handshake TLS (uTLS/http) fallo: %w", err)\par
+\tab\}\par
+\tab rawConn.SetDeadline(time.Time\{\})\par
+\tab return uConn, nil\par
+\}\par
+\par
+// httpProxyHandler recibe peticiones HTTP del cliente Node y las reenv\'eda al\par
+// destino usando uTLS (mismo fingerprint Chrome que el bridge WS). Parametros\par
+// esperados como JSON en el body del POST:\par
+//\par
+//\tab\{ "method": "GET",\par
+//\tab   "url": "{{\field{\*\fldinst{HYPERLINK https://... }}{\fldrslt{https://...\ul0\cf0}}}}\f0\fs22 ",\par
+//\tab   "headers": \{ "Header-Name": "value" \},\par
+//\tab   "body": "<base64 del cuerpo>"  // vac\'edo string si no hay body\par
+//\tab   "proxyHost": "...", "proxyPort": "...",\par
+//\tab   "proxyUser": "...", "proxyPass": "..."  // opcionales\par
+//\tab\}\par
+//\par
+// La respuesta es JSON:\par
+//\par
+//\tab\{ "statusCode": 200,\par
+//\tab   "headers": \{ "Content-Type": [...] \},\par
+//\tab   "body": "<base64>" \}\par
+func chromeHTTP11Spec() (*utls.ClientHelloSpec, error) \{\par
+\tab spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)\par
+\tab if err != nil \{\par
+\tab\tab return nil, fmt.Errorf("preset Chrome no disponible: %w", err)\par
+\tab\}\par
+\par
+\tab extensions := make([]utls.TLSExtension, 0, len(spec.Extensions))\par
+\tab for _, ext := range spec.Extensions \{\par
+\tab\tab switch e := ext.(type) \{\par
+\tab\tab case *utls.ALPNExtension:\par
+\tab\tab\tab e.AlpnProtocols = []string\{"http/1.1"\}\par
+\tab\tab\tab extensions = append(extensions, e)\par
+\tab\tab case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:\par
+\tab\tab\tab continue\par
+\tab\tab default:\par
+\tab\tab\tab extensions = append(extensions, ext)\par
+\tab\tab\}\par
+\tab\}\par
+\tab spec.Extensions = extensions\par
+\tab return &spec, nil\par
+\}\par
+\par
+func writeProxyError(w http.ResponseWriter, statusCode int, message string) \{\par
+\tab w.Header().Set("Content-Type", "application/json")\par
+\tab w.WriteHeader(statusCode)\par
+\tab json.NewEncoder(w).Encode(map[string]interface\{\}\{\par
+\tab\tab "statusCode": statusCode,\par
+\tab\tab "headers":    map[string][]string\{\},\par
+\tab\tab "body":       base64.StdEncoding.EncodeToString([]byte(message)),\par
+\tab\tab "error":      message,\par
+\tab\})\par
+\}\par
+\par
+func httpProxyHandler(w http.ResponseWriter, r *http.Request) \{\par
+\tab if r.Method != http.MethodPost \{\par
+\tab\tab writeProxyError(w, http.StatusMethodNotAllowed, "se requiere POST")\par
+\tab\tab return\par
+\tab\}\par
+\par
+\tab type inRequest struct \{\par
+\tab\tab Method    string            `json:"method"`\par
+\tab\tab URL       string            `json:"url"`\par
+\tab\tab Headers   map[string]string `json:"headers"`\par
+\tab\tab Body      string            `json:"body"`\par
+\tab\tab ProxyHost string            `json:"proxyHost"`\par
+\tab\tab ProxyPort string            `json:"proxyPort"`\par
+\tab\tab ProxyUser string            `json:"proxyUser"`\par
+\tab\tab ProxyPass string            `json:"proxyPass"`\par
+\tab\}\par
+\par
+\tab var req inRequest\par
+\tab if err := json.NewDecoder(r.Body).Decode(&req); err != nil \{\par
+\tab\tab writeProxyError(w, http.StatusBadRequest, fmt.Sprintf("JSON invalido: %v", err))\par
+\tab\tab return\par
+\tab\}\par
+\par
+\tab parsedURL, err := url.Parse(req.URL)\par
+\tab if err != nil || (parsedURL.Scheme != "https" && parsedURL.Scheme != "http") \{\par
+\tab\tab writeProxyError(w, http.StatusBadRequest, "URL invalida o esquema no soportado")\par
+\tab\tab return\par
+\tab\}\par
+\par
+\tab host := parsedURL.Hostname()\par
+\tab port := parsedURL.Port()\par
+\tab if port == "" \{\par
+\tab\tab if parsedURL.Scheme == "https" \{\par
+\tab\tab\tab port = "443"\par
+\tab\tab\} else \{\par
+\tab\tab\tab port = "80"\par
+\tab\tab\}\par
+\tab\}\par
+\par
+\tab var proxy *proxyConfig\par
+\tab if req.ProxyHost != "" && req.ProxyPort != "" \{\par
+\tab\tab proxy = &proxyConfig\{\par
+\tab\tab\tab host: req.ProxyHost,\par
+\tab\tab\tab port: req.ProxyPort,\par
+\tab\tab\tab user: req.ProxyUser,\par
+\tab\tab\tab pass: req.ProxyPass,\par
+\tab\tab\}\par
+\tab\}\par
+\par
+\tab ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)\par
+\tab defer cancel()\par
+\par
+\tab var conn net.Conn\par
+\tab if parsedURL.Scheme == "https" \{\par
+\tab\tab conn, err = dialUTLSForHTTP(ctx, host, port, proxy)\par
+\tab\} else \{\par
+\tab\tab if proxy != nil \{\par
+\tab\tab\tab conn, err = connectThroughProxy(ctx, proxy, net.JoinHostPort(host, port))\par
+\tab\tab\} else \{\par
+\tab\tab\tab d := net.Dialer\{Timeout: 15 * time.Second\}\par
+\tab\tab\tab conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))\par
+\tab\tab\}\par
+\tab\}\par
+\tab if err != nil \{\par
+\tab\tab writeProxyError(w, http.StatusBadGateway, fmt.Sprintf("error de conexion: %v", err))\par
+\tab\tab return\par
+\tab\}\par
+\tab defer conn.Close()\par
+\par
+\tab var bodyBytes []byte\par
+\tab if req.Body != "" \{\par
+\tab\tab bodyBytes, err = base64.StdEncoding.DecodeString(req.Body)\par
+\tab\tab if err != nil \{\par
+\tab\tab\tab writeProxyError(w, http.StatusBadRequest, "body base64 invalido")\par
+\tab\tab\tab return\par
+\tab\tab\}\par
+\tab\}\par
+\par
+\tab pathQuery := parsedURL.RequestURI()\par
+\tab var bodyReader io.Reader\par
+\tab if len(bodyBytes) > 0 \{\par
+\tab\tab bodyReader = bytes.NewReader(bodyBytes)\par
+\tab\} else \{\par
+\tab\tab bodyReader = http.NoBody\par
+\tab\}\par
+\tab httpReq, err := http.NewRequestWithContext(ctx, req.Method, "", bodyReader)\par
+\tab if err != nil \{\par
+\tab\tab writeProxyError(w, http.StatusInternalServerError, fmt.Sprintf("error construyendo request: %v", err))\par
+\tab\tab return\par
+\tab\}\par
+\tab httpReq.URL = parsedURL\par
+\tab httpReq.RequestURI = pathQuery\par
+\tab httpReq.Host = host\par
+\tab // Connection: close para que el servidor senale EOF cerrando el socket;\par
+\tab // sin esto, si la respuesta no trae Content-Length ni chunked encoding,\par
+\tab // io.ReadAll se quedar\'eda esperando indefinidamente.\par
+\tab httpReq.Close = true\par
+\tab for k, v := range req.Headers \{\par
+\tab\tab httpReq.Header.Set(k, v)\par
+\tab\}\par
+\tab if len(bodyBytes) > 0 && httpReq.Header.Get("Content-Length") == "" \{\par
+\tab\tab httpReq.ContentLength = int64(len(bodyBytes))\par
+\tab\}\par
+\par
+\tab // Escribir HTTP/1.1 crudo sobre el conn uTLS\par
+\tab if err := httpReq.Write(conn); err != nil \{\par
+\tab\tab writeProxyError(w, http.StatusBadGateway, fmt.Sprintf("error enviando request: %v", err))\par
+\tab\tab return\par
+\tab\}\par
+\par
+\tab // El deadline cubre tanto los headers (ReadResponse) como el body\par
+\tab // completo (io.ReadAll): se borra solo al terminar de leer todo.\par
+\tab conn.SetDeadline(time.Now().Add(20 * time.Second))\par
+\tab resp, err := http.ReadResponse(newBufReader(conn), httpReq)\par
+\tab if err != nil \{\par
+\tab\tab conn.SetDeadline(time.Time\{\})\par
+\tab\tab writeProxyError(w, http.StatusBadGateway, fmt.Sprintf("error leyendo respuesta: %v", err))\par
+\tab\tab return\par
+\tab\}\par
+\tab defer resp.Body.Close()\par
+\par
+\tab respBody, err := io.ReadAll(resp.Body)\par
+\tab conn.SetDeadline(time.Time\{\})\par
+\tab if err != nil \{\par
+\tab\tab writeProxyError(w, http.StatusBadGateway, fmt.Sprintf("error leyendo body: %v", err))\par
+\tab\tab return\par
+\tab\}\par
+\par
+\tab respHeaders := make(map[string][]string)\par
+\tab for k, vs := range resp.Header \{\par
+\tab\tab respHeaders[k] = vs\par
+\tab\}\par
+\par
+\tab w.Header().Set("Content-Type", "application/json")\par
+\tab json.NewEncoder(w).Encode(map[string]interface\{\}\{\par
+\tab\tab "statusCode": resp.StatusCode,\par
+\tab\tab "headers":    respHeaders,\par
+\tab\tab "body":       base64.StdEncoding.EncodeToString(respBody),\par
+\tab\})\par
+\}\par
+\par
+// newBufReader envuelve un net.Conn en un bufio.Reader para http.ReadResponse.\par
+func newBufReader(conn net.Conn) *bufio.Reader \{\par
+\tab return bufio.NewReader(conn)\par
+\}\par
+\par
+func main() \{\par
+\tab port := flag.Int("port", 8791, "puerto local donde escucha el sidecar (127.0.0.1)")\par
+\tab flag.Parse()\par
+\par
+\tab mux := http.NewServeMux()\par
+\tab mux.HandleFunc("/bridge", bridgeHandler)\par
+\tab mux.HandleFunc("/http", httpProxyHandler)\par
+\par
+\tab addr := fmt.Sprintf("127.0.0.1:%d", *port)\par
+\tab listener, err := net.Listen("tcp", addr)\par
+\tab if err != nil \{\par
+\tab\tab log.Fatalf("no se pudo escuchar en %s: %v", addr, err)\par
+\tab\}\par
+\par
+\tab server := &http.Server\{Handler: mux\}\par
+\par
+\tab go func() \{\par
+\tab\tab if err := server.Serve(listener); err != nil && err != http.ErrServerClosed \{\par
+\tab\tab\tab log.Fatalf("error del servidor: %v", err)\par
+\tab\tab\}\par
+\tab\}()\par
+\par
+\tab // Le avisa a quien lo haya lanzado (main.js) que ya esta listo para\par
+\tab // aceptar conexiones. main.js debe leer esta linea de stdout antes de\par
+\tab // permitir connect() desde la UI.\par
+\tab fmt.Printf("LISTENING %d\\n", *port)\par
+\par
+\tab sigCh := make(chan os.Signal, 1)\par
+\tab signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)\par
+\tab <-sigCh\par
+\par
+\tab log.Println("[sidecar] apagando...")\par
+\tab ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)\par
+\tab defer cancel()\par
+\tab server.Shutdown(ctx)\par
+\}\par
+}
+ 

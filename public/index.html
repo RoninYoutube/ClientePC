@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RingToss Client PC</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <canvas id="particle-bg" aria-hidden="true"></canvas>
+    <main class="app-shell">
+      <section class="topbar">
+        <div>
+          <div class="brand-title">
+            <img src="../logo.png" alt="">
+            <h1>RingToss Client PC</h1>
+          </div>
+          <div class="status-row" id="global-status"></div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <button id="globalConfigBtn" type="button" class="btn-add" data-action="open-global-config" title="Configuración global">⚙️</button>
+            <button id="supplierDrawerBtn" type="button" class="btn-add" data-action="open-supplier-drawer" title="Proveedor de ítems">📦</button>
+            <button id="add-account-btn" type="button" class="btn-add">Agregar cuenta</button>
+        </div>
+      </section>
+      
+<!-- Pop-up de configuración global (inicialmente oculto). El contenido interno
+     (menú de features vs. la pantalla de "Programar conexión") lo arma
+     app.js en #global-config-body, así el pop-up puede cambiar de vista
+     sin cerrarse y sin tocar la tab de fondo. -->
+<div id="globalConfigPopup" class="global-config-popup" style="display:none;">
+  <div class="popup-content">
+    <h3>Configuración global</h3>
+    <button type="button" id="closeConfigPopup" class="close-btn" data-action="close-global-config">✕</button>
+    <div id="global-config-body"></div>
+  </div>
+</div>
+
+<div id="createAccountPopup" class="create-account-popup" style="display:none;">
+  <div class="popup-content create-account-content">
+    <h3>Crear cuenta</h3>
+    <button type="button" class="close-btn" data-action="close-create-account">x</button>
+    <label>
+      Nombre
+      <input type="text" id="create-account-nick" spellcheck="false" autocomplete="off">
+    </label>
+    <div class="gender-row">
+      <span>Hombre</span>
+      <label class="rule-switch off">
+        <input type="checkbox" id="create-account-gender">
+        <span></span>
+      </label>
+      <span>Mujer</span>
+    </div>
+    <button type="button" data-action="submit-create-account">Crear</button>
+  </div>
+</div>
+
+<!-- Drawer del proveedor de items: panel fijo a la derecha, fondo solido
+     (a diferencia del pop-up de arriba, que flota centrado). Queda siempre
+     en el DOM; se abre/cierra vía la clase .open (permite animar el
+     deslizamiento) en vez de display:none. -->
+<div id="supplierDrawerBackdrop" class="supplier-drawer-backdrop" data-action="close-supplier-drawer"></div>
+<aside id="supplierDrawer" class="supplier-drawer" aria-hidden="true">
+  <div class="supplier-drawer-header">
+    <h3>Proveedor de ítems</h3>
+    <button type="button" class="close-btn" data-action="close-supplier-drawer">✕</button>
+  </div>
+  <div id="supplier-drawer-body"></div>
+</aside>
+      <section class="accounts" id="accounts"></section>
+
+      <section class="global-allies-view" id="global-allies-view" style="display:none;">
+        <div class="global-allies-topbar">
+          <button type="button" class="secondary btn-back" data-action="global-allies-back">&larr; Volver</button>
+          <h2>Aliados Globales</h2>
+        </div>
+        <div class="global-allies-columns">
+          <div class="people-column">
+            <div class="column-title">Mixed</div>
+            <div class="people-list" id="global-mixed-list"></div>
+          </div>
+          <div class="people-column">
+            <div class="column-title">Aliados</div>
+            <div class="people-list" id="global-allies-list"></div>
+          </div>
+          <div class="people-column">
+            <div class="column-title">Enemigos</div>
+            <div class="people-list" id="global-enemies-list"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <section class="log-dock" id="log-dock">
+      <div class="log-resize-handle" id="log-resize-handle"></div>
+      <div class="log-tabs" id="log-tabs"></div>
+      <pre id="log"></pre>
+      <div class="chat-composer" id="chat-composer"></div>
+    </section>
+
+    <script src="app.js"></script>
+  </body>
+  
+</html>
